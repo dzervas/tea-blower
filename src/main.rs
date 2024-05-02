@@ -1,25 +1,119 @@
 #![no_std]
 #![no_main]
 
-use log::*;
+use embassy_rp::dma::{AnyChannel, Channel};
+use embassy_rp::pio::{Common, Config, FifoJoin, Instance, InterruptHandler, Pio, PioPin, ShiftConfig, ShiftDirection, StateMachine};
 use embassy_executor::Spawner;
 use embassy_futures::select::{select, Either};
-use embassy_rp::bind_interrupts;
+use embassy_rp::{bind_interrupts, clocks, into_ref, Peripheral, PeripheralRef};
 use embassy_rp::gpio::{self, Input, Pull};
-use embassy_rp::peripherals::USB;
-use embassy_rp::usb::{Driver, InterruptHandler};
+use embassy_rp::peripherals::{PIO0, USB};
+use embassy_rp::usb::{Driver, InterruptHandler as UsbInterruptHandler};
 use embassy_time::Timer;
+use fixed::types::U24F8;
+use fixed_macro::fixed;
 use gpio::{Level, Output};
+use log::*;
+
 use defmt_rtt as _;
 use panic_probe as _;
+use smart_leds::colors::{BLUE, GREEN, RED, YELLOW};
+use smart_leds::RGB8;
 
 const TIMER_SECS: u64 = 210;
-const DEBOUNCE_MS: u64 = 250;
+const DEBOUNCE_MS: u64 = 200;
 const DOUBLE_PRESS_MS: u64 = 500;
 
 bind_interrupts!(struct Irqs {
-	USBCTRL_IRQ => InterruptHandler<USB>;
+	USBCTRL_IRQ => UsbInterruptHandler<USB>;
+	PIO0_IRQ_0 => InterruptHandler<PIO0>;
 });
+
+pub struct Ws2812<'d, P: Instance, const S: usize> {
+	dma: PeripheralRef<'d, AnyChannel>,
+	sm: StateMachine<'d, P, S>,
+}
+
+impl<'d, P: Instance, const S: usize> Ws2812<'d, P, S> {
+	pub fn new(
+		pio: &mut Common<'d, P>,
+		mut sm: StateMachine<'d, P, S>,
+		dma: impl Peripheral<P = impl Channel> + 'd,
+		pin: impl PioPin,
+	) -> Self {
+		into_ref!(dma);
+
+		// Setup sm0
+
+		// prepare the PIO program
+		let side_set = pio::SideSet::new(false, 1, false);
+		let mut a: pio::Assembler<32> = pio::Assembler::new_with_side_set(side_set);
+
+		const T1: u8 = 2; // start bit
+		const T2: u8 = 5; // data bit
+		const T3: u8 = 3; // stop bit
+		const CYCLES_PER_BIT: u32 = (T1 + T2 + T3) as u32;
+
+		let mut wrap_target = a.label();
+		let mut wrap_source = a.label();
+		let mut do_zero = a.label();
+		a.set_with_side_set(pio::SetDestination::PINDIRS, 1, 0);
+		a.bind(&mut wrap_target);
+		// Do stop bit
+		a.out_with_delay_and_side_set(pio::OutDestination::X, 1, T3 - 1, 0);
+		// Do start bit
+		a.jmp_with_delay_and_side_set(pio::JmpCondition::XIsZero, &mut do_zero, T1 - 1, 1);
+		// Do data bit = 1
+		a.jmp_with_delay_and_side_set(pio::JmpCondition::Always, &mut wrap_target, T2 - 1, 1);
+		a.bind(&mut do_zero);
+		// Do data bit = 0
+		a.nop_with_delay_and_side_set(T2 - 1, 0);
+		a.bind(&mut wrap_source);
+
+		let prg = a.assemble_with_wrap(wrap_source, wrap_target);
+		let mut cfg = Config::default();
+
+		// Pin config
+		let out_pin = pio.make_pio_pin(pin);
+		cfg.set_out_pins(&[&out_pin]);
+		cfg.set_set_pins(&[&out_pin]);
+
+		cfg.use_program(&pio.load_program(&prg), &[&out_pin]);
+
+		// Clock config, measured in kHz to avoid overflows
+		// TODO CLOCK_FREQ should come from embassy_rp
+		let clock_freq = U24F8::from_num(clocks::clk_sys_freq() / 1000);
+		let ws2812_freq = fixed!(800: U24F8);
+		let bit_freq = ws2812_freq * CYCLES_PER_BIT;
+		cfg.clock_divider = clock_freq / bit_freq;
+
+		// FIFO config
+		cfg.fifo_join = FifoJoin::TxOnly;
+		cfg.shift_out = ShiftConfig {
+			auto_fill: true,
+			threshold: 24,
+			direction: ShiftDirection::Left,
+		};
+
+		sm.set_config(&cfg);
+		sm.set_enable(true);
+
+		Self {
+			dma: dma.map_into(),
+			sm,
+		}
+	}
+
+	pub async fn write(&mut self, color: &RGB8) {
+		// Precompute the word bytes from the colors
+		let words = [(u32::from(color.r) << 24) | (u32::from(color.g) << 16) | (u32::from(color.b) << 8)];
+
+		// DMA transfer
+		self.sm.tx().dma_push(self.dma.reborrow(), &words).await;
+
+		Timer::after_micros(55).await;
+	}
+}
 
 #[embassy_executor::task]
 async fn logger_task(driver: Driver<'static, USB>) {
@@ -38,6 +132,17 @@ async fn main(spawner: Spawner) {
 	let mut blower = Output::new(p.PIN_7, Level::Low);
 	let mut button = Input::new(p.PIN_15, Pull::Down);
 
+	// LED
+	let Pio { mut common, sm0, .. } = Pio::new(p.PIO0, Irqs);
+	let mut led = Ws2812::new(&mut common, sm0, p.DMA_CH0, p.PIN_16);
+
+	for _ in 0..3 {
+		led.write(&GREEN).await;
+		Timer::after_millis(250).await;
+		led.write(&RGB8::default()).await;
+		Timer::after_millis(250).await;
+	}
+
 	loop {
 		button.wait_for_high().await;
 		Timer::after_millis(DEBOUNCE_MS).await;
@@ -45,21 +150,44 @@ async fn main(spawner: Spawner) {
 		info!("Button pressed");
 		blower.set_high();
 
-		let wait_time = match select(Timer::after_secs(DOUBLE_PRESS_MS), button.wait_for_high()).await {
+		let wait_time = match select(Timer::after_millis(DOUBLE_PRESS_MS), button.wait_for_high()).await {
 			// Timed out
-			Either::First(_) => TIMER_SECS,
+			Either::First(_) => {
+				led.write(&BLUE).await;
+				Timer::after_secs(2).await;
+				led.write(&RGB8::default()).await;
+				TIMER_SECS
+			},
 			// Double press
 			Either::Second(_) => {
 				info!("Double press");
+				led.write(&YELLOW).await;
+				Timer::after_secs(2).await;
+				led.write(&RGB8::default()).await;
 				TIMER_SECS * 2
 			},
 		};
 
-		Timer::after_millis(DEBOUNCE_MS).await;
 		// Either the button is pressed again or the timer expires
 		match select(Timer::after_secs(wait_time), button.wait_for_high()).await {
-			Either::First(_) => info!("Timer expired"),
-			Either::Second(_) => info!("Button pressed again"),
+			Either::First(_) => {
+				info!("Timer expired");
+				for _ in 0..3 {
+					led.write(&GREEN).await;
+					Timer::after_millis(500).await;
+					led.write(&RGB8::default()).await;
+					Timer::after_millis(500).await;
+				}
+			},
+			Either::Second(_) => {
+				info!("Button pressed again");
+				for _ in 0..3 {
+					led.write(&RED).await;
+					Timer::after_millis(500).await;
+					led.write(&RGB8::default()).await;
+					Timer::after_millis(500).await;
+				}
+			},
 		}
 
 		blower.set_low();
