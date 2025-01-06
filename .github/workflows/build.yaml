@@ -35,7 +35,7 @@ jobs:
           current_version: ${{ steps.version.outputs.app }}
           level: ${{ github.event.inputs.bump }}
 
-      - name: Update Chart.yaml and Cargo.toml
+      - name: Update Cargo.toml
         run: sed -i "s/^version = .*/version = \"${{ steps.new_app.outputs.new_version }}\"/" Cargo.toml
 
       - name: Commit changes
@@ -44,7 +44,7 @@ jobs:
         with:
           branch: main
           commit_message: Bump version to ${{ steps.new_app.outputs.new_version }}
-          file_pattern: Cargo.toml chart/Chart.yaml
+          file_pattern: Cargo.toml
 
   build:
     runs-on: ubuntu-latest
@@ -54,18 +54,15 @@ jobs:
         with:
           ref: ${{ needs.bump.outputs.new_ref }}
 
-      - run: sudo apt-get install -y gcc-aarch64-linux-gnu
-        if: matrix.target.triplet == 'aarch64-unknown-linux-gnu'
-
       - name: Install Rust toolchain
         id: rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          target: ${{ matrix.target.triplet }}
+          target: thumbv6m-none-eabi
 
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: ${{ steps.rust.outputs.cachekey }}-${{ matrix.target.triplet }}-${{ matrix.feature }}
+          prefix-key: ${{ steps.rust.outputs.cachekey }}
 
       - name: Compile
         run: |
