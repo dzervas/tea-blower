@@ -69,6 +69,7 @@ jobs:
 
       - name: Build UF2
         run: |
+          sudo apt-get install -y libudev-dev
           cargo install elf2uf2-rs
           elf2uf2-rs target/thumbv6m-none-eabi/debug/tea-blower tea-blower.uf2
 
