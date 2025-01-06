@@ -65,10 +65,10 @@ jobs:
           prefix-key: ${{ steps.rust.outputs.cachekey }}
 
       - name: Compile
-        run: |
-          cargo build --release
+        run: cargo build --release
 
       - name: Build UF2
+        run: |
           cargo install elf2uf2-rs
           elf2uf2-rs target/thumbv6m-none-eabi/debug/tea-blower tea-blower.uf2
 
