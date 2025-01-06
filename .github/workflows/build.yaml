@@ -100,4 +100,4 @@ jobs:
           target_commitish: ${{ needs.bump.outputs.new_ref }}
           generate_release_notes: true
           make_latest: true
-          files: tea-blower.uf2
+          files: binary/tea-blower.uf2
