@@ -6,7 +6,7 @@ use embassy_futures::select::{select, Either};
 use embassy_rp::bind_interrupts;
 use embassy_rp::gpio::{self, Input, Pull};
 use embassy_rp::peripherals::{PIO0, USB};
-use embassy_rp::pio::{Pio, InterruptHandler};
+use embassy_rp::pio::InterruptHandler;
 use embassy_rp::usb::{Driver, InterruptHandler as UsbInterruptHandler};
 use embassy_time::Timer;
 use gpio::{Level, Output};
@@ -14,15 +14,10 @@ use log::*;
 
 use defmt_rtt as _;
 use panic_probe as _;
-use smart_leds::colors::{BLUE, GREEN, RED, YELLOW};
-use smart_leds::RGB8;
-
-pub mod ws2812;
-use ws2812::Ws2812;
 
 const TIMER_SECS: u64 = 210;
-const DEBOUNCE_MS: u64 = 200;
-const DOUBLE_PRESS_MS: u64 = 500;
+const DEBOUNCE_MS: u64 = 250;
+const DOUBLE_PRESS_MS: u64 = 2000;
 
 bind_interrupts!(struct Irqs {
 	USBCTRL_IRQ => UsbInterruptHandler<USB>;
@@ -47,13 +42,14 @@ async fn main(spawner: Spawner) {
 	let mut button = Input::new(p.PIN_15, Pull::Down);
 
 	// LED
-	let Pio { mut common, sm0, .. } = Pio::new(p.PIO0, Irqs);
-	let mut led = Ws2812::new(&mut common, sm0, p.DMA_CH0, p.PIN_16);
+	let mut led_r = Output::new(p.PIN_9, Level::High);
+	let mut led_g = Output::new(p.PIN_10, Level::High);
+	let mut led_b = Output::new(p.PIN_11, Level::High);
 
 	for _ in 0..3 {
-		led.write(&GREEN).await;
+		led_g.set_low();
 		Timer::after_millis(250).await;
-		led.write(&RGB8::default()).await;
+		led_g.set_high();
 		Timer::after_millis(250).await;
 	}
 
@@ -63,48 +59,58 @@ async fn main(spawner: Spawner) {
 
 		info!("Button pressed");
 		blower.set_high();
+		led_b.set_low(); // Show that the button was pressed
 
 		let wait_time = match select(Timer::after_millis(DOUBLE_PRESS_MS), button.wait_for_high()).await {
 			// Timed out
 			Either::First(_) => {
-				led.write(&BLUE).await;
-				Timer::after_secs(2).await;
-				led.write(&RGB8::default()).await;
+				info!("Single press");
+				led_b.set_low();
 				TIMER_SECS
 			},
 			// Double press
 			Either::Second(_) => {
 				info!("Double press");
-				led.write(&YELLOW).await;
-				Timer::after_secs(2).await;
-				led.write(&RGB8::default()).await;
+				led_b.set_high();
+				led_r.set_low();
+				led_g.set_low();
 				TIMER_SECS * 2
 			},
+		};
+
+		Timer::after_millis(250).await;
+
+		let mut clear_all = || {
+			blower.set_low();
+			led_b.set_high();
+			led_r.set_high();
+			led_g.set_high();
 		};
 
 		// Either the button is pressed again or the timer expires
 		match select(Timer::after_secs(wait_time), button.wait_for_high()).await {
 			Either::First(_) => {
+				clear_all();
 				info!("Timer expired");
 				for _ in 0..3 {
-					led.write(&GREEN).await;
+					led_g.set_low();
 					Timer::after_millis(500).await;
-					led.write(&RGB8::default()).await;
+					led_g.set_high();
 					Timer::after_millis(500).await;
 				}
 			},
 			Either::Second(_) => {
+				clear_all();
 				info!("Button pressed again");
 				for _ in 0..3 {
-					led.write(&RED).await;
+					led_r.set_low();
 					Timer::after_millis(500).await;
-					led.write(&RGB8::default()).await;
+					led_r.set_high();
 					Timer::after_millis(500).await;
 				}
 			},
 		}
 
-		blower.set_low();
 		Timer::after_millis(500).await;
 	}
 }
